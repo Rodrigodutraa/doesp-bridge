@@ -10,15 +10,13 @@ from zoneinfo import ZoneInfo
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 DOE_SEARCH = "https://do-api-web-search.doe.sp.gov.br"
 DOE_PDF = "https://do-api-publication-pdf.doe.sp.gov.br"
 DOE_WEB = "https://doe.sp.gov.br"
 SEARCH_URL = f"{DOE_SEARCH}/v2/advanced-search/publications"
 JOURNALS_URL = f"{DOE_SEARCH}/v2/journals"
 SECTIONS_URL = f"{DOE_SEARCH}/v2/sections"
-SUMMARY_STRUCTURED_URL = f"{DOE_SEARCH}/v3/summary/structured"
-SUMMARY_LIST_URL = f"{DOE_SEARCH}/v2/summary/list"
 EDITION_URL = f"{DOE_PDF}/v1/editions/url"
 TIMEOUT = float(os.getenv("DOESP_TIMEOUT_SECONDS", "25"))
 PAGE_SIZE = 100
@@ -61,7 +59,6 @@ def unique(values: List[str]) -> List[str]:
 def identifier_variants(value: str) -> List[str]:
     d = digits(value)
     variants = [value, d, d.lstrip("0")]
-    # DOE frequently publishes an internal number without the check digit.
     if re.search(r"[-./]", value or "") and len(d) >= 5:
         variants += [d[:-1], d[:-1].lstrip("0")]
     return unique([v for v in variants if v])
@@ -82,11 +79,7 @@ def profile_terms() -> List[str]:
 
 def text_has_identifier(text: str) -> bool:
     td = digits(text)
-    for value in all_identifiers():
-        d = digits(value)
-        if d and d in td:
-            return True
-    return False
+    return any(digits(v) and digits(v) in td for v in all_identifiers())
 
 
 def extract_items(payload: Any) -> List[Dict[str, Any]]:
@@ -190,7 +183,6 @@ def hierarchy_parts(item: Dict[str, Any]) -> List[str]:
 
 
 async def journals(day: date) -> List[Dict[str, Any]]:
-    # The unfiltered endpoint is canonical; date is kept as fallback for old backend behavior.
     for params in (None, {"date": day.isoformat()}):
         response = await http_get(JOURNALS_URL, params=params)
         if response.status_code < 400:
@@ -251,37 +243,28 @@ def candidate_strings(value: Any) -> List[str]:
     return out
 
 
-def edition_reference(response: httpx.Response) -> Tuple[Optional[str], Optional[str], Any]:
+def edition_reference(response: httpx.Response) -> Tuple[Optional[str], Optional[str]]:
     payload = response_payload(response)
     for candidate in candidate_strings(payload):
-        if not candidate:
-            continue
-        match = UUID_RE.search(candidate)
+        match = UUID_RE.search(candidate or "")
         eid = match.group(0) if match else None
         if candidate.startswith("http://") or candidate.startswith("https://"):
-            return eid, candidate, payload
+            return eid, candidate.replace("http://", "https://")
         if candidate.startswith("/") or candidate.startswith("v1/"):
-            return eid, urljoin(DOE_PDF + "/", candidate), payload
+            return eid, urljoin(DOE_PDF + "/", candidate)
         if eid:
-            return eid, f"{DOE_PDF}/v1/editions/{eid}", payload
-    return None, None, payload
+            return eid, f"{DOE_PDF}/v1/editions/{eid}"
+    return None, None
 
 
 async def get_edition_reference(journal_id: str, root_id: str, day: date) -> Dict[str, Any]:
     params = {"JournalId": journal_id, "RootSectionId": root_id, "EditionDate": day.isoformat()}
     response = await http_get(EDITION_URL, params=params)
     result: Dict[str, Any] = {"requestStatus": response.status_code}
-    if response.status_code >= 400:
-        return result
-    eid, url, payload = edition_reference(response)
-    result["edition_id"] = eid
-    result["editionUrl"] = url
-    if payload is not None:
-        try:
-            serialized = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
-            result["editionUrlResponse"] = serialized[:400]
-        except Exception:
-            pass
+    if response.status_code < 400:
+        eid, url = edition_reference(response)
+        result["edition_id"] = eid
+        result["editionUrl"] = url
     return result
 
 
@@ -299,8 +282,8 @@ def coerce_page(value: Any) -> Optional[int]:
     if isinstance(value, str):
         match = re.search(r"\b(\d{1,4})\b", value.strip())
         if match:
-            p = int(match.group(1))
-            return p if p > 0 else None
+            page = int(match.group(1))
+            return page if page > 0 else None
     return None
 
 
@@ -313,121 +296,73 @@ def direct_page(node: Dict[str, Any]) -> Optional[int]:
     return None
 
 
-def publication_score(node: Dict[str, Any], item: Dict[str, Any]) -> int:
-    score = 0
-    iid = str(item.get("id") or "")
-    title = norm(str(item.get("title") or ""))
-    slug = str(item.get("slug") or "").lower()
-
-    for key in ("id", "publicationId", "publication_id", "documentId", "document_id"):
-        if iid and str(node.get(key) or "") == iid:
-            score += 100
-    node_title = norm(str(node.get("title") or node.get("name") or node.get("publicationTitle") or ""))
-    if title and node_title:
-        if node_title == title:
-            score += 80
-        elif title in node_title or node_title in title:
-            score += 45
-    node_slug = str(node.get("slug") or node.get("url") or node.get("link") or "").lower()
-    if slug and node_slug and (slug in node_slug or node_slug.endswith(slug)):
-        score += 100
-    return score
-
-
-def find_page_in_payload(payload: Any, item: Dict[str, Any]) -> Tuple[Optional[int], Optional[str], int]:
-    best_page: Optional[int] = None
-    best_path: Optional[str] = None
-    best_score = -1
-
-    def walk(value: Any, path: str) -> None:
-        nonlocal best_page, best_path, best_score
-        if isinstance(value, dict):
-            page = direct_page(value)
-            score = publication_score(value, item)
-            if page and score > best_score:
-                best_page, best_path, best_score = page, path, score
-            for key, child in value.items():
-                walk(child, f"{path}.{key}")
-        elif isinstance(value, list):
-            for index, child in enumerate(value):
-                walk(child, f"{path}[{index}]")
-
-    walk(payload, "$")
-    # Require positive publication evidence; never select an arbitrary page field.
-    if best_score <= 0:
-        return None, None, best_score
-    return best_page, best_path, best_score
-
-
-async def page_from_summary(item: Dict[str, Any], journal_id: str, root_id: str, day: date) -> Dict[str, Any]:
-    params_variants = [
-        {"JournalId": journal_id, "RootSectionId": root_id, "EditionDate": day.isoformat()},
-        {"JournalId": journal_id, "RootSectionId": root_id, "date": day.isoformat()},
-        {"JournalId": journal_id, "SectionId": root_id, "EditionDate": day.isoformat()},
-    ]
-    probes: List[Dict[str, Any]] = []
-    for endpoint_name, url in (("summary_structured", SUMMARY_STRUCTURED_URL), ("summary_list", SUMMARY_LIST_URL)):
-        for params in params_variants:
-            response = await http_get(url, params=params)
-            probe: Dict[str, Any] = {"endpoint": endpoint_name, "status": response.status_code, "params": params}
-            if response.status_code < 400:
-                payload = response_payload(response)
-                page, path, score = find_page_in_payload(payload, item)
-                probe["matchScore"] = score
+def first_page_in_payload(payload: Any, path: str = "$") -> Tuple[Optional[int], Optional[str]]:
+    if isinstance(payload, dict):
+        page = direct_page(payload)
+        if page:
+            return page, path
+        # Prefer common wrapper keys before generic traversal.
+        for key in ("data", "item", "publication", "result"):
+            if key in payload:
+                page, found_path = first_page_in_payload(payload[key], f"{path}.{key}")
                 if page:
-                    return {"page": page, "source": endpoint_name, "path": path, "score": score, "probes": probes + [probe]}
-            probes.append(probe)
-    return {"page": None, "probes": probes}
+                    return page, found_path
+        for key, value in payload.items():
+            page, found_path = first_page_in_payload(value, f"{path}.{key}")
+            if page:
+                return page, found_path
+    elif isinstance(payload, list):
+        for index, value in enumerate(payload):
+            page, found_path = first_page_in_payload(value, f"{path}[{index}]")
+            if page:
+                return page, found_path
+    return None, None
 
 
 async def page_from_publication_detail(item: Dict[str, Any]) -> Dict[str, Any]:
-    # The site route is /{journal}/{section}/{titleId}; probe official API equivalents only.
     slug = str(item.get("slug") or "").strip("/")
     iid = str(item.get("id") or "")
+    probes: List[Dict[str, Any]] = []
+
+    # v2/publications/{slug} is the exact official detail object used by the public site.
     urls: List[str] = []
     if slug:
-        urls += [
-            f"{DOE_SEARCH}/v2/publications/{slug}",
-            f"{DOE_SEARCH}/v1/publications/{slug}",
-        ]
+        urls.append(f"{DOE_SEARCH}/v2/publications/{slug}")
     if iid:
-        urls += [
-            f"{DOE_SEARCH}/v2/publications/{iid}",
-            f"{DOE_SEARCH}/v1/publications/{iid}",
-        ]
+        urls.append(f"{DOE_SEARCH}/v2/publications/{iid}")
 
-    probes: List[Dict[str, Any]] = []
     for url in unique(urls):
         response = await http_get(url)
         probe: Dict[str, Any] = {"url": url, "status": response.status_code}
         if response.status_code < 400:
             payload = response_payload(response)
-            page, path, score = find_page_in_payload(payload, item)
-            probe["matchScore"] = score
+            page, path = first_page_in_payload(payload)
+            if isinstance(payload, dict):
+                probe["topLevelKeys"] = list(payload.keys())[:30]
             if page:
-                return {"page": page, "source": "publication_detail", "path": path, "score": score, "probes": probes + [probe]}
+                probe["page"] = page
+                return {"page": page, "source": "publication_detail", "path": path, "probes": probes + [probe]}
         probes.append(probe)
     return {"page": None, "probes": probes}
-
-
-def item_page(item: Dict[str, Any]) -> Optional[int]:
-    return direct_page(item)
 
 
 async def locate(item: Dict[str, Any]) -> Dict[str, Any]:
     try:
         day = date.fromisoformat(str(item.get("date") or "")[:10])
     except Exception:
-        return {"locatorStatus": "edition_not_resolved", "reason": "publication_date_missing"}
+        return {"locatorStatus": "edition_not_resolved", "reason": "publication_date_missing", "pdfReadByBridge": False}
 
     journal = await resolve_journal(item, day)
     if not journal or not journal.get("id"):
-        return {"locatorStatus": "edition_not_resolved", "reason": "journal_not_resolved"}
+        return {"locatorStatus": "edition_not_resolved", "reason": "journal_not_resolved", "pdfReadByBridge": False}
     journal_id = str(journal["id"])
 
     roots = await root_sections(journal_id)
     if not roots:
-        return {"locatorStatus": "edition_not_resolved", "reason": "root_sections_not_resolved", "journal_id": journal_id}
+        return {"locatorStatus": "edition_not_resolved", "reason": "root_sections_not_resolved", "journal_id": journal_id, "pdfReadByBridge": False}
+
+    detail = await page_from_publication_detail(item)
+    page = detail.get("page") or direct_page(item)
 
     attempts: List[Dict[str, Any]] = []
     for root in ordered_roots(item, roots):
@@ -440,27 +375,7 @@ async def locate(item: Dict[str, Any]) -> Dict[str, Any]:
         if not edition.get("editionUrl"):
             continue
 
-        page = item_page(item)
-        page_source = "search_item"
-        page_path = "$"
-
-        if not page:
-            summary_result = await page_from_summary(item, journal_id, root_id, day)
-            page = summary_result.get("page")
-            page_source = summary_result.get("source") or page_source
-            page_path = summary_result.get("path") or page_path
-            attempts[-1]["summaryProbes"] = summary_result.get("probes")
-
-        if not page:
-            detail_result = await page_from_publication_detail(item)
-            page = detail_result.get("page")
-            page_source = detail_result.get("source") or page_source
-            page_path = detail_result.get("path") or page_path
-            attempts[-1]["publicationDetailProbes"] = detail_result.get("probes")
-
         if page:
-            start = max(1, page - 1)
-            end = page + 1
             return {
                 "locatorStatus": "resolved",
                 "edition_id": edition.get("edition_id"),
@@ -474,17 +389,17 @@ async def locate(item: Dict[str, Any]) -> Dict[str, Any]:
                 "publication_page_start": page,
                 "publication_page_end": page,
                 "recommended_read_pages": [p for p in (page - 1, page, page + 1) if p >= 1],
-                "pageMetadataSource": page_source,
-                "pageMetadataPath": page_path,
-                "locatorEvidence": "official search + journals + sections + editions/url + publication/summary page metadata; PDF not read by bridge",
+                "pageMetadataSource": detail.get("source") or "search_item",
+                "pageMetadataPath": detail.get("path") or "$",
+                "locatorEvidence": "official publication detail + journals + sections + editions/url; PDF not read by bridge",
                 "pdfReadByBridge": False,
             }
 
-    has_edition = any(a.get("editionUrl") for a in attempts)
     return {
-        "locatorStatus": "edition_resolved_page_not_resolved" if has_edition else "edition_not_resolved",
+        "locatorStatus": "edition_resolved_page_not_resolved" if any(a.get("editionUrl") for a in attempts) else "edition_not_resolved",
         "journal_id": journal_id,
         "journal": journal.get("name") or journal.get("title"),
+        "publicationDetailProbes": detail.get("probes"),
         "rootSectionAttempts": attempts[:10],
         "pdfReadByBridge": False,
     }
