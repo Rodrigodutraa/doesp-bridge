@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 DOE_SEARCH = "https://do-api-web-search.doe.sp.gov.br"
 DOE_PDF = "https://do-api-publication-pdf.doe.sp.gov.br"
 DOE_WEB = "https://doe.sp.gov.br"
@@ -178,45 +178,6 @@ async def profile_search(from_date: date, to_date: date) -> Dict[str, Any]:
     return {"matches": matches, "pages": pages, "truncated": truncated, "weak": weak}
 
 
-def hierarchy_parts(item: Dict[str, Any]) -> List[str]:
-    return [x.strip() for x in str(item.get("hierarchy") or "").split(">") if x.strip()]
-
-
-async def journals(day: date) -> List[Dict[str, Any]]:
-    for params in (None, {"date": day.isoformat()}):
-        response = await http_get(JOURNALS_URL, params=params)
-        if response.status_code < 400:
-            items = extract_items(response.json())
-            if items:
-                return items
-    return []
-
-
-async def resolve_journal(item: Dict[str, Any], day: date) -> Optional[Dict[str, Any]]:
-    parts = hierarchy_parts(item)
-    wanted = norm(parts[0]) if parts else ""
-    values = await journals(day)
-    for journal in values:
-        if norm(str(journal.get("name") or journal.get("title") or "")) == wanted:
-            return journal
-    if str(item.get("slug") or "").startswith("executivo/"):
-        for journal in values:
-            if norm(str(journal.get("name") or "")) == "executivo":
-                return journal
-    return None
-
-
-async def root_sections(journal_id: str) -> List[Dict[str, Any]]:
-    response = await http_get(SECTIONS_URL, params={"JournalId": journal_id})
-    return extract_items(response.json()) if response.status_code < 400 else []
-
-
-def ordered_roots(item: Dict[str, Any], roots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    parts = hierarchy_parts(item)
-    wanted = norm(parts[1]) if len(parts) > 1 else ""
-    return sorted(roots, key=lambda r: 0 if norm(str(r.get("name") or r.get("title") or "")) == wanted else 1)
-
-
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}")
 
 
@@ -257,6 +218,76 @@ def edition_reference(response: httpx.Response) -> Tuple[Optional[str], Optional
     return None, None
 
 
+async def publication_detail(item: Dict[str, Any]) -> Dict[str, Any]:
+    slug = str(item.get("slug") or "").strip("/")
+    iid = str(item.get("id") or "")
+    probes: List[Dict[str, Any]] = []
+    urls = []
+    if slug:
+        urls.append(f"{DOE_SEARCH}/v2/publications/{slug}")
+    if iid:
+        urls.append(f"{DOE_SEARCH}/v2/publications/{iid}")
+    for url in unique(urls):
+        response = await http_get(url)
+        probe = {"url": url, "status": response.status_code}
+        if response.status_code < 400:
+            payload = response_payload(response)
+            if isinstance(payload, dict):
+                return {"payload": payload, "probes": probes + [probe]}
+        probes.append(probe)
+    return {"payload": None, "probes": probes}
+
+
+def coerce_page(value: Any) -> Optional[int]:
+    if isinstance(value, int) and value > 0:
+        return value
+    if isinstance(value, float) and value.is_integer() and value > 0:
+        return int(value)
+    if isinstance(value, str) and re.fullmatch(r"\s*\d{1,4}\s*", value):
+        page = int(value.strip())
+        return page if page > 0 else None
+    return None
+
+
+def pages_from_edition_pages(value: Any) -> List[int]:
+    pages: List[int] = []
+    if value is None:
+        return pages
+    scalar = coerce_page(value)
+    if scalar:
+        return [scalar]
+    if isinstance(value, list):
+        for child in value:
+            pages += pages_from_edition_pages(child)
+    elif isinstance(value, dict):
+        # Inside editionPages, number/sequence can legitimately mean the edition page.
+        priority_keys = (
+            "page", "pageNumber", "page_number", "editionPage", "edition_page",
+            "publicationPage", "publication_page", "number", "pageIndex", "page_index"
+        )
+        for key in priority_keys:
+            if key in value:
+                page = coerce_page(value.get(key))
+                if page:
+                    pages.append(page)
+        if not pages:
+            for key, child in value.items():
+                if "page" in norm(str(key)):
+                    pages += pages_from_edition_pages(child)
+    return sorted(set(pages))
+
+
+def detail_pages(payload: Dict[str, Any]) -> List[int]:
+    pages = pages_from_edition_pages(payload.get("editionPages"))
+    if pages:
+        return pages
+    for key in ("page", "pageNumber", "publicationPage", "startPage", "initialPage"):
+        page = coerce_page(payload.get(key))
+        if page:
+            return [page]
+    return []
+
+
 async def get_edition_reference(journal_id: str, root_id: str, day: date) -> Dict[str, Any]:
     params = {"JournalId": journal_id, "RootSectionId": root_id, "EditionDate": day.isoformat()}
     response = await http_get(EDITION_URL, params=params)
@@ -268,82 +299,25 @@ async def get_edition_reference(journal_id: str, root_id: str, day: date) -> Dic
     return result
 
 
-PAGE_KEYS = (
-    "page", "pageNumber", "page_number", "publicationPage", "publication_page",
-    "startPage", "start_page", "initialPage", "initial_page", "firstPage", "first_page"
-)
-
-
-def coerce_page(value: Any) -> Optional[int]:
-    if isinstance(value, int) and value > 0:
-        return value
-    if isinstance(value, float) and value.is_integer() and value > 0:
-        return int(value)
-    if isinstance(value, str):
-        match = re.search(r"\b(\d{1,4})\b", value.strip())
-        if match:
-            page = int(match.group(1))
-            return page if page > 0 else None
-    return None
-
-
-def direct_page(node: Dict[str, Any]) -> Optional[int]:
-    for key in PAGE_KEYS:
-        if key in node:
-            page = coerce_page(node.get(key))
-            if page:
-                return page
-    return None
-
-
-def first_page_in_payload(payload: Any, path: str = "$") -> Tuple[Optional[int], Optional[str]]:
-    if isinstance(payload, dict):
-        page = direct_page(payload)
-        if page:
-            return page, path
-        # Prefer common wrapper keys before generic traversal.
-        for key in ("data", "item", "publication", "result"):
-            if key in payload:
-                page, found_path = first_page_in_payload(payload[key], f"{path}.{key}")
-                if page:
-                    return page, found_path
-        for key, value in payload.items():
-            page, found_path = first_page_in_payload(value, f"{path}.{key}")
-            if page:
-                return page, found_path
-    elif isinstance(payload, list):
-        for index, value in enumerate(payload):
-            page, found_path = first_page_in_payload(value, f"{path}[{index}]")
-            if page:
-                return page, found_path
-    return None, None
-
-
-async def page_from_publication_detail(item: Dict[str, Any]) -> Dict[str, Any]:
-    slug = str(item.get("slug") or "").strip("/")
-    iid = str(item.get("id") or "")
-    probes: List[Dict[str, Any]] = []
-
-    # v2/publications/{slug} is the exact official detail object used by the public site.
-    urls: List[str] = []
-    if slug:
-        urls.append(f"{DOE_SEARCH}/v2/publications/{slug}")
-    if iid:
-        urls.append(f"{DOE_SEARCH}/v2/publications/{iid}")
-
-    for url in unique(urls):
-        response = await http_get(url)
-        probe: Dict[str, Any] = {"url": url, "status": response.status_code}
-        if response.status_code < 400:
-            payload = response_payload(response)
-            page, path = first_page_in_payload(payload)
-            if isinstance(payload, dict):
-                probe["topLevelKeys"] = list(payload.keys())[:30]
-            if page:
-                probe["page"] = page
-                return {"page": page, "source": "publication_detail", "path": path, "probes": probes + [probe]}
-        probes.append(probe)
-    return {"page": None, "probes": probes}
+async def resolve_ids_from_hierarchy(item: Dict[str, Any], day: date) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    parts = [x.strip() for x in str(item.get("hierarchy") or "").split(">") if x.strip()]
+    journal_name = parts[0] if parts else None
+    section_name = parts[1] if len(parts) > 1 else None
+    journals_response = await http_get(JOURNALS_URL)
+    journals = extract_items(journals_response.json()) if journals_response.status_code < 400 else []
+    journal = next((j for j in journals if norm(str(j.get("name") or "")) == norm(journal_name or "")), None)
+    if not journal and str(item.get("slug") or "").startswith("executivo/"):
+        journal = next((j for j in journals if norm(str(j.get("name") or "")) == "executivo"), None)
+    if not journal:
+        return None, None, journal_name, section_name
+    journal_id = str(journal.get("id") or "") or None
+    if not journal_id:
+        return None, None, journal_name, section_name
+    sections_response = await http_get(SECTIONS_URL, params={"JournalId": journal_id})
+    sections = extract_items(sections_response.json()) if sections_response.status_code < 400 else []
+    section = next((s for s in sections if norm(str(s.get("name") or "")) == norm(section_name or "")), None)
+    root_id = str(section.get("id") or "") if section else None
+    return journal_id, root_id or None, journal.get("name") or journal_name, (section.get("name") if section else section_name)
 
 
 async def locate(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -352,55 +326,73 @@ async def locate(item: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         return {"locatorStatus": "edition_not_resolved", "reason": "publication_date_missing", "pdfReadByBridge": False}
 
-    journal = await resolve_journal(item, day)
-    if not journal or not journal.get("id"):
-        return {"locatorStatus": "edition_not_resolved", "reason": "journal_not_resolved", "pdfReadByBridge": False}
-    journal_id = str(journal["id"])
+    detail_result = await publication_detail(item)
+    detail = detail_result.get("payload") or {}
+    pages = detail_pages(detail) if isinstance(detail, dict) else []
 
-    roots = await root_sections(journal_id)
-    if not roots:
-        return {"locatorStatus": "edition_not_resolved", "reason": "root_sections_not_resolved", "journal_id": journal_id, "pdfReadByBridge": False}
+    # Exact official publication detail is authoritative for journal/section linkage.
+    journal_id = str(detail.get("journalId") or "") or None
+    root_id = str(detail.get("firstLevelSectionId") or detail.get("sectionId") or "") or None
+    journal_name = detail.get("journal")
+    section_name = detail.get("firstLevelSectionName") or detail.get("section")
 
-    detail = await page_from_publication_detail(item)
-    page = detail.get("page") or direct_page(item)
+    if not journal_id or not root_id:
+        journal_id, root_id, fallback_journal, fallback_section = await resolve_ids_from_hierarchy(item, day)
+        journal_name = journal_name or fallback_journal
+        section_name = section_name or fallback_section
 
-    attempts: List[Dict[str, Any]] = []
-    for root in ordered_roots(item, roots):
-        root_id = str(root.get("id") or "")
-        if not root_id:
-            continue
-        section_name = root.get("name") or root.get("title")
-        edition = await get_edition_reference(journal_id, root_id, day)
-        attempts.append({"root_section_id": root_id, "section": section_name, **edition})
-        if not edition.get("editionUrl"):
-            continue
+    if not journal_id or not root_id:
+        return {
+            "locatorStatus": "edition_not_resolved",
+            "reason": "journal_or_section_not_resolved",
+            "publicationDetailProbes": detail_result.get("probes"),
+            "pdfReadByBridge": False,
+        }
 
-        if page:
-            return {
-                "locatorStatus": "resolved",
-                "edition_id": edition.get("edition_id"),
-                "editionUrl": edition.get("editionUrl"),
-                "journal_id": journal_id,
-                "journal": journal.get("name") or journal.get("title"),
-                "root_section_id": root_id,
-                "section": section_name,
-                "edition_date": day.isoformat(),
-                "match_page": page,
-                "publication_page_start": page,
-                "publication_page_end": page,
-                "recommended_read_pages": [p for p in (page - 1, page, page + 1) if p >= 1],
-                "pageMetadataSource": detail.get("source") or "search_item",
-                "pageMetadataPath": detail.get("path") or "$",
-                "locatorEvidence": "official publication detail + journals + sections + editions/url; PDF not read by bridge",
-                "pdfReadByBridge": False,
-            }
+    edition = await get_edition_reference(journal_id, root_id, day)
+    if not edition.get("editionUrl"):
+        return {
+            "locatorStatus": "edition_not_resolved",
+            "journal_id": journal_id,
+            "root_section_id": root_id,
+            "editionRequest": edition,
+            "pdfReadByBridge": False,
+        }
 
+    if not pages:
+        return {
+            "locatorStatus": "edition_resolved_page_not_resolved",
+            "edition_id": edition.get("edition_id"),
+            "editionUrl": edition.get("editionUrl"),
+            "journal_id": journal_id,
+            "journal": journal_name,
+            "root_section_id": root_id,
+            "section": section_name,
+            "edition_date": day.isoformat(),
+            "publicationDetailKeys": list(detail.keys())[:30] if isinstance(detail, dict) else [],
+            "editionPagesRaw": detail.get("editionPages") if isinstance(detail, dict) else None,
+            "pdfReadByBridge": False,
+        }
+
+    start = min(pages)
+    end = max(pages)
+    recommended = list(range(max(1, start - 1), end + 2))
     return {
-        "locatorStatus": "edition_resolved_page_not_resolved" if any(a.get("editionUrl") for a in attempts) else "edition_not_resolved",
+        "locatorStatus": "resolved",
+        "edition_id": edition.get("edition_id"),
+        "editionUrl": edition.get("editionUrl"),
         "journal_id": journal_id,
-        "journal": journal.get("name") or journal.get("title"),
-        "publicationDetailProbes": detail.get("probes"),
-        "rootSectionAttempts": attempts[:10],
+        "journal": journal_name,
+        "root_section_id": root_id,
+        "section": section_name,
+        "edition_date": day.isoformat(),
+        "publication_pages": pages,
+        "match_page": pages[0] if len(pages) == 1 else None,
+        "publication_page_start": start,
+        "publication_page_end": end,
+        "recommended_read_pages": recommended,
+        "pageMetadataSource": "official v2/publications detail.editionPages",
+        "locatorEvidence": "official publication detail + editions/url; PDF not read by bridge",
         "pdfReadByBridge": False,
     }
 
