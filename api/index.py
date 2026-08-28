@@ -6,7 +6,7 @@ from urllib.parse import urljoin
 import httpx
 from fastapi import FastAPI,HTTPException,Query
 from pypdf import PdfReader
-VERSION="1.4.6-debug";DOE_BASE="https://do-api-web-search.doe.sp.gov.br";SEARCH_URL=f"{DOE_BASE}/v2/advanced-search/publications";JOURNALS_URL=f"{DOE_BASE}/v2/journals";PDF_BASE="https://do-api-publication-pdf.doe.sp.gov.br";WEB_BASE="https://doe.sp.gov.br";TIMEOUT=25;PAGE_SIZE=100;MAX_PAGES=50
+VERSION="1.4.7-debug";DOE_BASE="https://do-api-web-search.doe.sp.gov.br";SEARCH_URL=f"{DOE_BASE}/v2/advanced-search/publications";JOURNALS_URL=f"{DOE_BASE}/v2/journals";PDF_BASE="https://do-api-publication-pdf.doe.sp.gov.br";WEB_BASE="https://doe.sp.gov.br";TIMEOUT=25;PAGE_SIZE=100;MAX_PAGES=50
 app=FastAPI(title="DOE-SP Bridge",version=VERSION)
 def env_list(n):return[x.strip() for x in re.split(r"[|,;\r\n]+",os.getenv(n,""))if x.strip()]
 NAME=os.getenv("DOESP_PROFILE_NAME","").strip();MATS=env_list("DOESP_PROFILE_MATRICULAS");RGS=env_list("DOESP_PROFILE_RGS");CPFS=env_list("DOESP_PROFILE_CPFS");OTHER=env_list("DOESP_PROFILE_OTHER_IDS")
@@ -63,7 +63,7 @@ async def profile(fd,td):
   if verified(x):y=dict(x);y["matchConfidence"]="verified";y["matchedBy"]=["name","identifier"];m.append(y)
   else:weak+=1
  m.sort(key=lambda x:str(x.get("date")or""));return m,pages,tr,weak
-EDITION_URL_RE=re.compile(r"(?:https?:)?//do-api-publication-pdf\.doe\.sp\.gov\.br/v1/editions/([0-9a-fA-F-]{36})",re.I)
+
 def page_match(reader):
  nn=norm(NAME);ids=[digs(x)for x in MATS+RGS+CPFS+OTHER if digs(x)]
  for i,p in enumerate(reader.pages,1):
@@ -72,39 +72,28 @@ def page_match(reader):
   if not ids or any(v in td or v.lstrip("0")in td for v in ids):return i
  return None
 async def frontend_probe(url,text):
- scripts=uniq([urljoin(url,s)for s in re.findall(r'<script[^>]+src=["\']([^"\']+)',text,re.I)])[:30];contexts=[];apis=[]
- tokens=["/v1/editions/status/","do-api-publication-pdf.doe.sp.gov.br","/v1/editions/","hub/publication-document"]
+ scripts=uniq([urljoin(url,s)for s in re.findall(r'<script[^>]+src=["\']([^"\']+)',text,re.I)])[:30];contexts=[]
+ tokens=["supplementary-editions/url","EditionDate","JournalId","RootSectionId","editions/url","edition/url","v1/editions","pdfId","checkPdfStatus"]
  for src in scripts:
   try:r=await get(src,accept="text/javascript,*/*")
   except Exception:continue
   if r.status_code>=400:continue
   body=r.text;low=body.lower()
   for token in tokens:
-   start=0
+   start=0;count=0
    while True:
     pos=low.find(token.lower(),start)
     if pos<0:break
-    contexts.append({"script":src,"token":token,"context":body[max(0,pos-500):pos+900]});start=pos+len(token)
-    if len(contexts)>=30:break
-  for m in re.findall(r'https?://[^"\'`\\\s]+',body):
-   if"do-api"in m:apis.append(m[:400])
- return{"scripts":scripts,"apiStrings":uniq(apis)[:50],"tokenContexts":contexts[:30]}
+    contexts.append({"script":src,"token":token,"context":body[max(0,pos-900):pos+1500]});start=pos+len(token);count+=1
+    if count>=6 or len(contexts)>=80:break
+ return{"scripts":scripts,"tokenContexts":contexts[:80]}
 async def pubprobe(item,deep=False):
  slug=item.get("slug");url=f"{WEB_BASE}/{str(slug).lstrip('/')}"if slug else None
- if not url:return{"status":None,"editionIds":[]}
- r=await get(url,accept="text/html,*/*");text=r.text;z={"url":url,"status":r.status_code,"editionIds":uniq([m.group(1)for m in EDITION_URL_RE.finditer(text)]),"htmlSize":len(text)}
- if deep:z["frontend"]=await frontend_probe(url,text)
+ if not url:return{"status":None}
+ r=await get(url,accept="text/html,*/*");z={"url":url,"status":r.status_code,"htmlSize":len(r.text)}
+ if deep:z["frontend"]=await frontend_probe(url,r.text)
  return z
-async def locate(item):
- d=await pubprobe(item);tested=[]
- for eid in d.get("editionIds",[]):
-  url=f"{PDF_BASE}/v1/editions/{eid}";r=await get(url,accept="application/pdf,*/*");tested.append({"id":eid,"status":r.status_code})
-  if r.status_code>=400 or not(r.content.startswith(b"%PDF")or"pdf"in(r.headers.get("content-type")or"").lower()):continue
-  try:reader=PdfReader(BytesIO(r.content));pg=page_match(reader)
-  except Exception:continue
-  if pg:
-   total=len(reader.pages);a=max(1,pg-1);b=min(total,pg+1);return{"locatorStatus":"resolved","edition_id":eid,"editionUrl":url,"match_page":pg,"publication_page_start":a,"publication_page_end":b,"recommended_read_pages":list(range(a,b+1)),"total_pages":total}
- return{"locatorStatus":"edition_found_match_not_located"if d.get("editionIds")else"edition_not_resolved","publicationPageStatus":d.get("status"),"testedEditions":tested}
+async def locate(item):return{"locatorStatus":"edition_not_resolved","reason":"debug_mapping_in_progress"}
 def org(x):
  t=norm(item_text(x));return"MPSP"if"ministerio publico"in t else("CGE-SP"if"controladoria geral do estado"in t else"DOE-SP")
 def cat(x):
@@ -112,10 +101,7 @@ def cat(x):
 async def enrich(xs):
  out=[]
  for x in xs:
-  y=dict(x);y["organization"]=org(y);y["category"]=cat(y);y["relevance"]="functional";y["officialUrl"]=f"{WEB_BASE}/{str(y.get('slug')).lstrip('/')}"if y.get("slug")else None
-  try:y["documentLocator"]=await locate(y)
-  except Exception as e:y["documentLocator"]={"locatorStatus":"locator_error","errorType":type(e).__name__}
-  out.append(y)
+  y=dict(x);y["organization"]=org(y);y["category"]=cat(y);y["relevance"]="functional";y["officialUrl"]=f"{WEB_BASE}/{str(y.get('slug')).lstrip('/')}"if y.get("slug")else None;y["documentLocator"]=await locate(y);out.append(y)
  return out
 def summary(xs):
  bc={};bo={}
