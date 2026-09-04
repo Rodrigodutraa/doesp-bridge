@@ -33,10 +33,13 @@ Estados principais:
 
 - `GET /api/health`
 - `GET /api/search`
+- `GET /api/contest/auditor-cge?from_date=...&to_date=...`
 - `GET /api/me/today`
 - `GET /api/me?from_date=...&to_date=...`
 - `GET /api/me/log?from_date=...&to_date=...`
 - `GET /api/context?slug=...`
+
+`/api/contest/auditor-cge` pesquisa a nomenclatura oficial do cargo e o Edital CGE nº 03/2025, deduplica as publicações e descarta menções funcionais a auditores sem sinais do concurso. A resposta usa `match_count/matches`, o mesmo contrato de `/api/me`.
 
 ## Deploy contínuo
 
