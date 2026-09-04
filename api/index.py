@@ -2,17 +2,16 @@ import os
 import re
 import json
 import unicodedata
-from io import BytesIO
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import httpx
+import fitz
 from fastapi import FastAPI, HTTPException, Query
-from pypdf import PdfReader
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 DOE_SEARCH = "https://do-api-web-search.doe.sp.gov.br"
 DOE_PDF = "https://do-api-publication-pdf.doe.sp.gov.br"
 DOE_WEB = "https://doe.sp.gov.br"
@@ -339,17 +338,17 @@ async def locate_page_in_pdf(item: Dict[str, Any], edition_url: str) -> Dict[str
 
     title = norm(str(item.get("title") or ""))
     anchors = excerpt_anchors(item)
-    reader = PdfReader(BytesIO(response.content))
     best_page: Optional[int] = None
     best_score = 0
-    for index, page in enumerate(reader.pages):
-        page_text = norm(page.extract_text() or "")
-        excerpt_hits = sum(1 for anchor in anchors if anchor and anchor in page_text)
-        title_hit = bool(title and title in page_text)
-        score = excerpt_hits * 10 + (1 if title_hit else 0)
-        if score > best_score:
-            best_page = index + 1
-            best_score = score
+    with fitz.open(stream=response.content, filetype="pdf") as document:
+        for index, page in enumerate(document):
+            page_text = norm(page.get_text("text") or "")
+            excerpt_hits = sum(1 for anchor in anchors if anchor and anchor in page_text)
+            title_hit = bool(title and title in page_text)
+            score = excerpt_hits * 10 + (1 if title_hit else 0)
+            if score > best_score:
+                best_page = index + 1
+                best_score = score
 
     # Prefer excerpt evidence. Fall back to an exact title only when no excerpt
     # anchor survives PDF text extraction.
