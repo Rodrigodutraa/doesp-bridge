@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import json
@@ -8,10 +9,10 @@ from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import httpx
-import fitz
+import pymupdf as fitz
 from fastapi import FastAPI, HTTPException, Query
 
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 DOE_SEARCH = "https://do-api-web-search.doe.sp.gov.br"
 DOE_PDF = "https://do-api-publication-pdf.doe.sp.gov.br"
 DOE_WEB = "https://doe.sp.gov.br"
@@ -22,7 +23,9 @@ EDITION_URL = f"{DOE_PDF}/v1/editions/url"
 TIMEOUT = float(os.getenv("DOESP_TIMEOUT_SECONDS", "25"))
 PAGE_SIZE = 100
 MAX_PAGES = 50
-MAX_PDF_BYTES = int(os.getenv("DOESP_MAX_PDF_BYTES", str(40 * 1024 * 1024)))
+MAX_PDF_BYTES = int(os.getenv("DOESP_MAX_PDF_BYTES", str(64 * 1024 * 1024)))
+PDF_DOWNLOAD_ATTEMPTS = max(1, int(os.getenv("DOESP_PDF_DOWNLOAD_ATTEMPTS", "2")))
+PDF_SCAN_SEMAPHORE = asyncio.Semaphore(1)
 AUDITOR_CGE_TERMS = (
     "AUDITOR ESTADUAL DE CONTROLE",
     "EDITAL CGE Nº 03/2025",
@@ -329,18 +332,12 @@ def excerpt_anchors(item: Dict[str, Any], window: int = 8) -> List[str]:
     return unique([" ".join(words[int(start):int(start) + window]) for start in starts])
 
 
-async def locate_page_in_pdf(item: Dict[str, Any], edition_url: str) -> Dict[str, Any]:
-    response = await http_get(edition_url, accept="application/pdf")
-    if response.status_code >= 400:
-        return {"page": None, "reason": "edition_pdf_request_failed", "status": response.status_code}
-    if len(response.content) > MAX_PDF_BYTES:
-        return {"page": None, "reason": "edition_pdf_too_large", "bytes": len(response.content)}
-
+def scan_pdf_page(item: Dict[str, Any], content: bytes) -> Dict[str, Any]:
     title = norm(str(item.get("title") or ""))
     anchors = excerpt_anchors(item)
     best_page: Optional[int] = None
     best_score = 0
-    with fitz.open(stream=response.content, filetype="pdf") as document:
+    with fitz.open(stream=content, filetype="pdf") as document:
         for index, page in enumerate(document):
             page_text = norm(page.get_text("text") or "")
             excerpt_hits = sum(1 for anchor in anchors if anchor and anchor in page_text)
@@ -360,6 +357,59 @@ async def locate_page_in_pdf(item: Dict[str, Any], edition_url: str) -> Dict[str
             "titleMatched": bool(best_score % 10),
         }
     return {"page": None, "reason": "publication_text_not_found_in_edition"}
+
+
+async def locate_page_in_pdf(item: Dict[str, Any], edition_url: str) -> Dict[str, Any]:
+    # PyMuPDF expands compressed page structures in memory. Serializing scans in a
+    # warm function avoids overlapping large editions from concurrent requests.
+    async with PDF_SCAN_SEMAPHORE:
+        last_error: Optional[Dict[str, Any]] = None
+        for attempt in range(1, PDF_DOWNLOAD_ATTEMPTS + 1):
+            response = await http_get(edition_url, accept="application/pdf")
+            content = response.content
+            details = {"downloadAttempts": attempt, "bytes": len(content)}
+
+            if response.status_code >= 400:
+                last_error = {
+                    "page": None,
+                    "reason": "edition_pdf_request_failed",
+                    "status": response.status_code,
+                    **details,
+                }
+                continue
+            if len(content) > MAX_PDF_BYTES:
+                return {
+                    "page": None,
+                    "reason": "edition_pdf_too_large",
+                    "maxBytes": MAX_PDF_BYTES,
+                    **details,
+                }
+            if b"%PDF-" not in content[:1024]:
+                last_error = {
+                    "page": None,
+                    "reason": "edition_pdf_invalid_header",
+                    **details,
+                }
+                continue
+
+            try:
+                result = scan_pdf_page(item, content)
+                result.update(details)
+                return result
+            except Exception as exc:
+                last_error = {
+                    "page": None,
+                    "reason": "edition_pdf_read_failed",
+                    "errorType": exc.__class__.__name__,
+                    "error": str(exc)[:240],
+                    **details,
+                }
+
+        return last_error or {
+            "page": None,
+            "reason": "edition_pdf_download_exhausted",
+            "downloadAttempts": PDF_DOWNLOAD_ATTEMPTS,
+        }
 
 
 async def get_edition_reference(journal_id: str, root_id: str, day: date) -> Dict[str, Any]:
