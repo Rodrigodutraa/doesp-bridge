@@ -12,7 +12,7 @@ import httpx
 import pymupdf as fitz
 from fastapi import FastAPI, HTTPException, Query
 
-VERSION = "1.7.3"
+VERSION = "1.7.4"
 DOE_SEARCH = "https://do-api-web-search.doe.sp.gov.br"
 DOE_PDF = "https://do-api-publication-pdf.doe.sp.gov.br"
 DOE_WEB = "https://doe.sp.gov.br"
@@ -365,7 +365,17 @@ async def locate_page_in_pdf(item: Dict[str, Any], edition_url: str) -> Dict[str
     async with PDF_SCAN_SEMAPHORE:
         last_error: Optional[Dict[str, Any]] = None
         for attempt in range(1, PDF_DOWNLOAD_ATTEMPTS + 1):
-            response = await http_get(edition_url, accept="application/pdf")
+            try:
+                response = await http_get(edition_url, accept="application/pdf")
+            except httpx.RequestError as exc:
+                last_error = {
+                    "page": None,
+                    "reason": "edition_pdf_download_failed",
+                    "errorType": exc.__class__.__name__,
+                    "error": str(exc)[:240],
+                    "downloadAttempts": attempt,
+                }
+                continue
             content = response.content
             details = {"downloadAttempts": attempt, "bytes": len(content)}
 
