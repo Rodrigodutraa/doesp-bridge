@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-VERSION = "1.6.2"
+VERSION = "1.7.0"
 DOE_SEARCH = "https://do-api-web-search.doe.sp.gov.br"
 DOE_PDF = "https://do-api-publication-pdf.doe.sp.gov.br"
 DOE_WEB = "https://doe.sp.gov.br"
@@ -21,6 +21,10 @@ EDITION_URL = f"{DOE_PDF}/v1/editions/url"
 TIMEOUT = float(os.getenv("DOESP_TIMEOUT_SECONDS", "25"))
 PAGE_SIZE = 100
 MAX_PAGES = 50
+AUDITOR_CGE_TERMS = (
+    "AUDITOR ESTADUAL DE CONTROLE",
+    "EDITAL CGE Nº 03/2025",
+)
 
 app = FastAPI(title="DOE-SP Bridge", version=VERSION)
 
@@ -110,6 +114,32 @@ def identity_verified(item: Dict[str, Any]) -> bool:
     name_ok = bool(PROFILE_NAME and norm(PROFILE_NAME) in text)
     configured_ids = bool(PROFILE_MATRICULAS or PROFILE_RGS or PROFILE_CPFS or PROFILE_OTHER_IDS)
     return name_ok and (text_has_identifier(text) if configured_ids else True)
+
+
+def auditor_cge_contest_reasons(item: Dict[str, Any]) -> List[str]:
+    text = norm(item_text(item))
+    if "auditor estadual de controle" not in text:
+        return []
+
+    reasons: List[str] = []
+    markers = (
+        ("edital_cge_03_2025", "edital", "03/2025"),
+        ("concurso_publico", "concurso publico"),
+        ("comissao_concurso", "comissao especial de concurso"),
+        ("chamamento", "chamamento de candidatos"),
+        ("anuencia_vaga", "anuencia de vaga"),
+        ("candidato", "candidat"),
+        ("homologacao", "homologacao"),
+        ("classificacao", "classific"),
+        ("nomeacao", "nomea"),
+        ("posse", "posse"),
+        ("exercicio", "exercicio"),
+    )
+    for marker in markers:
+        label, *needles = marker
+        if all(needle in text for needle in needles):
+            reasons.append(label)
+    return unique(reasons)
 
 
 async def http_get(url: str, params: Optional[dict] = None, accept: str = "application/json,*/*") -> httpx.Response:
@@ -455,8 +485,70 @@ async def health():
 
 @app.get("/api/search")
 async def search(term: str = Query(...), from_date: date = Query(...), to_date: date = Query(...)):
+    if to_date < from_date:
+        raise HTTPException(400, "to_date deve ser maior ou igual a from_date")
     result = await raw_search(term, from_date, to_date)
-    return {"source": "DOE-SP API only", "term": term, "from_date": from_date, "to_date": to_date, "pages_fetched": result["pages"], "truncated": result["truncated"], "count": len(result["items"]), "items": result["items"]}
+    return {
+        "source": "DOE-SP API only",
+        "term": term,
+        "from_date": from_date,
+        "to_date": to_date,
+        "pages_fetched": result["pages"],
+        "truncated": result["truncated"],
+        "count": len(result["items"]),
+        "items": result["items"],
+        # Stable aliases shared with /api/me to prevent consumer ambiguity.
+        "match_count": len(result["items"]),
+        "matches": result["items"],
+    }
+
+
+@app.get("/api/contest/auditor-cge")
+async def auditor_cge_contest(from_date: date = Query(...), to_date: date = Query(...)):
+    if to_date < from_date:
+        raise HTTPException(400, "to_date deve ser maior ou igual a from_date")
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    pages = 0
+    truncated = False
+    for term in AUDITOR_CGE_TERMS:
+        result = await raw_search(term, from_date, to_date)
+        pages += result["pages"]
+        truncated = truncated or result["truncated"]
+        for item in result["items"]:
+            merged[item_key(item)] = item
+
+    candidates: List[Dict[str, Any]] = []
+    discarded = 0
+    for item in merged.values():
+        reasons = auditor_cge_contest_reasons(item)
+        if not reasons:
+            discarded += 1
+            continue
+        row = dict(item)
+        row["contestMatchReasons"] = reasons
+        candidates.append(row)
+
+    candidates.sort(key=lambda x: str(x.get("date") or ""))
+    matches = await enrich(candidates)
+    for row in matches:
+        row["organization"] = "CGE-SP"
+        row["category"] = "concurso_processo_seletivo"
+        row["relevance"] = "functional"
+
+    return {
+        "source": "DOE-SP API only",
+        "contest": "Concurso Público para Provimento de Vagas para o Cargo de Auditor Estadual de Controle",
+        "reference_notice": "Edital CGE nº 03/2025",
+        "terms": list(AUDITOR_CGE_TERMS),
+        "from_date": from_date,
+        "to_date": to_date,
+        "pages_fetched": pages,
+        "truncated": truncated,
+        "candidates_discarded": discarded,
+        "match_count": len(matches),
+        "matches": matches,
+    }
 
 
 @app.get("/api/me")
