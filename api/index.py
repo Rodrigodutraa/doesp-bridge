@@ -2,6 +2,7 @@ import os
 import re
 import json
 import unicodedata
+from io import BytesIO
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
@@ -9,8 +10,9 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
+from pypdf import PdfReader
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 DOE_SEARCH = "https://do-api-web-search.doe.sp.gov.br"
 DOE_PDF = "https://do-api-publication-pdf.doe.sp.gov.br"
 DOE_WEB = "https://doe.sp.gov.br"
@@ -21,6 +23,7 @@ EDITION_URL = f"{DOE_PDF}/v1/editions/url"
 TIMEOUT = float(os.getenv("DOESP_TIMEOUT_SECONDS", "25"))
 PAGE_SIZE = 100
 MAX_PAGES = 50
+MAX_PDF_BYTES = int(os.getenv("DOESP_MAX_PDF_BYTES", str(40 * 1024 * 1024)))
 AUDITOR_CGE_TERMS = (
     "AUDITOR ESTADUAL DE CONTROLE",
     "EDITAL CGE Nº 03/2025",
@@ -318,6 +321,48 @@ def detail_pages(payload: Dict[str, Any]) -> List[int]:
     return []
 
 
+def excerpt_anchors(item: Dict[str, Any], window: int = 8) -> List[str]:
+    words = norm(str(item.get("excerpt") or "")).split()
+    if len(words) < window:
+        return [" ".join(words)] if words else []
+    last = len(words) - window
+    starts = unique([str(x) for x in (0, last // 3, last // 2, (2 * last) // 3, last)])
+    return unique([" ".join(words[int(start):int(start) + window]) for start in starts])
+
+
+async def locate_page_in_pdf(item: Dict[str, Any], edition_url: str) -> Dict[str, Any]:
+    response = await http_get(edition_url, accept="application/pdf")
+    if response.status_code >= 400:
+        return {"page": None, "reason": "edition_pdf_request_failed", "status": response.status_code}
+    if len(response.content) > MAX_PDF_BYTES:
+        return {"page": None, "reason": "edition_pdf_too_large", "bytes": len(response.content)}
+
+    title = norm(str(item.get("title") or ""))
+    anchors = excerpt_anchors(item)
+    reader = PdfReader(BytesIO(response.content))
+    best_page: Optional[int] = None
+    best_score = 0
+    for index, page in enumerate(reader.pages):
+        page_text = norm(page.extract_text() or "")
+        excerpt_hits = sum(1 for anchor in anchors if anchor and anchor in page_text)
+        title_hit = bool(title and title in page_text)
+        score = excerpt_hits * 10 + (1 if title_hit else 0)
+        if score > best_score:
+            best_page = index + 1
+            best_score = score
+
+    # Prefer excerpt evidence. Fall back to an exact title only when no excerpt
+    # anchor survives PDF text extraction.
+    if best_page and best_score > 0:
+        return {
+            "page": best_page,
+            "score": best_score,
+            "excerptAnchorHits": best_score // 10,
+            "titleMatched": bool(best_score % 10),
+        }
+    return {"page": None, "reason": "publication_text_not_found_in_edition"}
+
+
 async def get_edition_reference(journal_id: str, root_id: str, day: date) -> Dict[str, Any]:
     params = {"JournalId": journal_id, "RootSectionId": root_id, "EditionDate": day.isoformat()}
     response = await http_get(EDITION_URL, params=params)
@@ -389,6 +434,12 @@ async def locate(item: Dict[str, Any]) -> Dict[str, Any]:
             "pdfReadByBridge": False,
         }
 
+    pdf_locator: Optional[Dict[str, Any]] = None
+    if not pages:
+        pdf_locator = await locate_page_in_pdf(item, str(edition.get("editionUrl")))
+        if pdf_locator.get("page"):
+            pages = [int(pdf_locator["page"])]
+
     if not pages:
         return {
             "locatorStatus": "edition_resolved_page_not_resolved",
@@ -401,7 +452,8 @@ async def locate(item: Dict[str, Any]) -> Dict[str, Any]:
             "edition_date": day.isoformat(),
             "publicationDetailKeys": list(detail.keys())[:30] if isinstance(detail, dict) else [],
             "editionPagesRaw": detail.get("editionPages") if isinstance(detail, dict) else None,
-            "pdfReadByBridge": False,
+            "pdfReadByBridge": True,
+            "pdfLocator": pdf_locator,
         }
 
     start = min(pages)
@@ -421,9 +473,10 @@ async def locate(item: Dict[str, Any]) -> Dict[str, Any]:
         "publication_page_start": start,
         "publication_page_end": end,
         "recommended_read_pages": recommended,
-        "pageMetadataSource": "official v2/publications detail.editionPages",
-        "locatorEvidence": "official publication detail + editions/url; PDF not read by bridge",
-        "pdfReadByBridge": False,
+        "pageMetadataSource": "official v2/publications detail.editionPages" if detail_pages(detail) else "official edition PDF text match",
+        "locatorEvidence": "official publication detail + editions/url" if detail_pages(detail) else "official edition PDF + publication title/excerpt anchors",
+        "pdfLocator": pdf_locator,
+        "pdfReadByBridge": bool(pdf_locator),
     }
 
 
@@ -478,8 +531,8 @@ async def health():
         "version": VERSION,
         "doesp_api_reachable": response.status_code < 500,
         "upstream_status": response.status_code,
-        "pdf_scanning": False,
-        "role": "document locator only",
+        "pdf_scanning": True,
+        "role": "document locator with official PDF fallback",
     }
 
 
